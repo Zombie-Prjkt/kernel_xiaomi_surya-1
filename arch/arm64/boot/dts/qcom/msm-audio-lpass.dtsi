@@ -829,4 +829,8 @@
 	pcie: qcom,msm-pcm-pcie {
 		compatible = "qcom,msm-pcm-pcie";
 	};
+
+	vlsp: qcom,msm-q6-vlsp {
+		compatible = "qcom,msm-q6-vlsp";
+	};
 };

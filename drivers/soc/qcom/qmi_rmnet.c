@@ -54,6 +54,7 @@ MODULE_PARM_DESC(rmnet_wq_frequency, "Frequency of PS check in ms");
 #define PS_INTERVAL (((!rmnet_wq_frequency) ?                             \
 					1 : rmnet_wq_frequency/10) * (HZ/100))
 #define NO_DELAY (0x0000 * HZ)
+#define PS_INTERVAL_KT (ms_to_ktime(1000))
 #define WATCHDOG_EXPIRE_JF (msecs_to_jiffies(50))
 
 #ifdef CONFIG_QCOM_QMI_DFC
@@ -1302,6 +1303,10 @@ void qmi_rmnet_work_exit(void *port)
 	synchronize_rcu();
 
 	rmnet_work_inited = false;
+<<<<<<< HEAD
+=======
+	alarm_cancel(&rmnet_work->atimer);
+>>>>>>> b6e26cd221090d536d20f03c3dcb13efc65dddb5
 	cancel_delayed_work_sync(&rmnet_work->work);
 	destroy_workqueue(rmnet_ps_wq);
 	qmi_rmnet_work_set_active(port, 0);
