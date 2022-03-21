@@ -74,7 +74,7 @@ __XCHG_CASE( ,  ,  mb_, 64, dmb ish, nop,  , a, l, "memory")
 #undef __XCHG_CASE
 
 #define __XCHG_GEN(sfx)							\
-static inline unsigned long __xchg##sfx(unsigned long x,		\
+static __always_inline  unsigned long __xchg##sfx(unsigned long x,	\
 					volatile void *ptr,		\
 					int size)			\
 {									\
@@ -116,16 +116,16 @@ __XCHG_GEN(_mb)
 #define xchg(...)		__xchg_wrapper( _mb, __VA_ARGS__)
 
 #define __CMPXCHG_GEN(sfx)						\
-static inline unsigned long __cmpxchg##sfx(volatile void *ptr,		\
+static __always_inline unsigned long __cmpxchg##sfx(volatile void *ptr,	\
 					   unsigned long old,		\
 					   unsigned long new,		\
 					   int size)			\
 {									\
 	switch (size) {							\
 	case 1:								\
-		return __cmpxchg_case##sfx##_8(ptr, old, new);		\
+		return __cmpxchg_case##sfx##_8(ptr, (u8)old, new);	\
 	case 2:								\
-		return __cmpxchg_case##sfx##_16(ptr, old, new);		\
+		return __cmpxchg_case##sfx##_16(ptr, (u16)old, new);	\
 	case 4:								\
 		return __cmpxchg_case##sfx##_32(ptr, old, new);		\
 	case 8:								\
@@ -197,12 +197,35 @@ __CMPXCHG_GEN(_mb)
 	__ret; \
 })
 
+/* this_cpu_cmpxchg */
+#define _protect_cmpxchg_local(pcp, o, n)			\
+({								\
+	typeof(*raw_cpu_ptr(&(pcp))) __ret;			\
+	preempt_enable();					\
+	__ret;							\
+})
+
+#define this_cpu_cmpxchg_1(ptr, o, n) _protect_cmpxchg_local(ptr, o, n)
+#define this_cpu_cmpxchg_2(ptr, o, n) _protect_cmpxchg_local(ptr, o, n)
+#define this_cpu_cmpxchg_4(ptr, o, n) _protect_cmpxchg_local(ptr, o, n)
+#define this_cpu_cmpxchg_8(ptr, o, n) _protect_cmpxchg_local(ptr, o, n)
+
+#define this_cpu_cmpxchg_double_8(ptr1, ptr2, o1, o2, n1, n2)		\
+({									\
+	int __ret;							\
+	preempt_disable();						\
+	__ret = cmpxchg_double_local(	raw_cpu_ptr(&(ptr1)),		\
+					raw_cpu_ptr(&(ptr2)),		\
+					o1, o2, n1, n2);		\
+	preempt_enable();						\
+	__ret;								\
+})
+
 #define __CMPWAIT_CASE(w, sfx, sz)					\
 static inline void __cmpwait_case_##sz(volatile void *ptr,		\
 				       unsigned long val)		\
 {									\
 	unsigned long tmp;						\
-									\
 	asm volatile(							\
 	"	sevl\n"							\
 	"	wfe\n"							\
@@ -223,7 +246,7 @@ __CMPWAIT_CASE( ,  , 64);
 #undef __CMPWAIT_CASE
 
 #define __CMPWAIT_GEN(sfx)						\
-static inline void __cmpwait##sfx(volatile void *ptr,			\
+static __always_inline void __cmpwait##sfx(volatile void *ptr,		\
 				  unsigned long val,			\
 				  int size)				\
 {									\
