@@ -1201,11 +1201,9 @@ static void sdhci_msm_set_mmc_drv_type(struct sdhci_host *host, u32 opcode,
 
 int sdhci_msm_execute_tuning(struct sdhci_host *host, u32 opcode)
 {
-	unsigned long flags;
-	int tuning_seq_cnt = 3;
-	u8 phase, *data_buf, tuned_phases[NUM_TUNING_PHASES], tuned_phase_cnt;
-	const u32 *tuning_block_pattern = tuning_block_64;
-	int size = sizeof(tuning_block_64); /* Tuning pattern size in bytes */
+	struct sdhci_host *host = mmc_priv(mmc);
+	int tuning_seq_cnt = 10;
+	u8 phase, tuned_phases[16], tuned_phase_cnt = 0;
 	int rc;
 	struct mmc_host *mmc = host->mmc;
 	struct mmc_ios	ios = host->mmc->ios;
@@ -1228,8 +1226,15 @@ int sdhci_msm_execute_tuning(struct sdhci_host *host, u32 opcode)
 		return 0;
 
 	/*
-	 * Don't allow re-tuning for CRC errors observed for any commands
-	 * that are sent during tuning sequence itself.
+	 * Clear tuning_done flag before tuning to ensure proper
+	 * HS400 settings.
+	 */
+	msm_host->tuning_done = 0;
+
+	/*
+	 * For HS400 tuning in HS200 timing requires:
+	 * - select MCLK/2 in VENDOR_SPEC
+	 * - program MCLK to 400MHz (or nearest supported) in GCC
 	 */
 	if (msm_host->tuning_in_progress)
 		return 0;
@@ -1398,6 +1403,22 @@ retry:
 		sdhci_msm_set_mmc_drv_type(host, opcode, 0);
 
 	if (tuned_phase_cnt) {
+		if (tuned_phase_cnt == ARRAY_SIZE(tuned_phases)) {
+			/*
+			 * All phases valid is _almost_ as bad as no phases
+			 * valid.  Probably all phases are not really reliable
+			 * but we didn't detect where the unreliable place is.
+			 * That means we'll essentially be guessing and hoping
+			 * we get a good phase.  Better to try a few times.
+			 */
+			dev_dbg(mmc_dev(mmc), "%s: All phases valid; try again\n",
+				mmc_hostname(mmc));
+			if (--tuning_seq_cnt) {
+				tuned_phase_cnt = 0;
+				goto retry;
+			}
+		}
+
 		rc = msm_find_most_appropriate_phase(host, tuned_phases,
 							tuned_phase_cnt);
 		if (rc < 0)
@@ -4545,205 +4566,16 @@ static struct sdhci_ops sdhci_msm_ops = {
 	.notify_load = sdhci_msm_notify_load,
 };
 
-static void sdhci_set_default_hw_caps(struct sdhci_msm_host *msm_host,
-		struct sdhci_host *host)
-{
-	u32 version, caps = 0;
-	u16 minor;
-	u8 major;
-	u32 val;
-	const struct sdhci_msm_offset *msm_host_offset =
-					msm_host->offset;
+static const struct sdhci_pltfm_data sdhci_msm_pdata = {
+	.quirks = SDHCI_QUIRK_BROKEN_CARD_DETECTION |
+		  SDHCI_QUIRK_NO_CARD_NO_RESET |
+		  SDHCI_QUIRK_SINGLE_POWER_WRITE |
+		  SDHCI_QUIRK_CAP_CLOCK_BASE_BROKEN |
+		  SDHCI_QUIRK_MULTIBLOCK_READ_ACMD12,
 
-	version = sdhci_msm_readl_relaxed(host,
-		msm_host_offset->CORE_MCI_VERSION);
-	major = (version & CORE_VERSION_MAJOR_MASK) >>
-			CORE_VERSION_MAJOR_SHIFT;
-	minor = version & CORE_VERSION_TARGET_MASK;
-
-	caps = readl_relaxed(host->ioaddr + SDHCI_CAPABILITIES);
-
-	/*
-	 * Starting with SDCC 5 controller (core major version = 1)
-	 * controller won't advertise 3.0v, 1.8v and 8-bit features
-	 * except for some targets.
-	 */
-	if (major >= 1 && minor != 0x11 && minor != 0x12) {
-		struct sdhci_msm_reg_data *vdd_io_reg;
-		/*
-		 * Enable 1.8V support capability on controllers that
-		 * support dual voltage
-		 */
-		vdd_io_reg = msm_host->pdata->vreg_data->vdd_io_data;
-		if (vdd_io_reg && (vdd_io_reg->high_vol_level > 2700000))
-			caps |= CORE_3_0V_SUPPORT;
-		if (vdd_io_reg && (vdd_io_reg->low_vol_level < 1950000))
-			caps |= CORE_1_8V_SUPPORT;
-		if (msm_host->pdata->mmc_bus_width == MMC_CAP_8_BIT_DATA)
-			caps |= CORE_8_BIT_SUPPORT;
-	}
-
-	/*
-	 * Enable one MID mode for SDCC5 (major 1) on 8916/8939 (minor 0x2e) and
-	 * on 8992 (minor 0x3e) as a workaround to reset for data stuck issue.
-	 */
-	if (major == 1 && (minor == 0x2e || minor == 0x3e)) {
-		host->quirks2 |= SDHCI_QUIRK2_USE_RESET_WORKAROUND;
-		val = readl_relaxed(host->ioaddr +
-			msm_host_offset->CORE_VENDOR_SPEC_FUNC2);
-		writel_relaxed((val | CORE_ONE_MID_EN),
-			host->ioaddr + msm_host_offset->CORE_VENDOR_SPEC_FUNC2);
-	}
-	/*
-	 * SDCC 5 controller with major version 1, minor version 0x34 and later
-	 * with HS 400 mode support will use CM DLL instead of CDC LP 533 DLL.
-	 */
-	if ((major == 1) && (minor < 0x34))
-		msm_host->use_cdclp533 = true;
-
-	/*
-	 * SDCC 5 controller with major version 1, minor version 0x42 and later
-	 * will require additional steps when resetting DLL.
-	 * It also supports HS400 enhanced strobe mode.
-	 */
-	if ((major == 1) && (minor >= 0x42)) {
-		msm_host->use_updated_dll_reset = true;
-		msm_host->enhanced_strobe = true;
-	}
-
-	/*
-	 * SDCC 5 controller with major version 1 and minor version 0x42,
-	 * 0x46 and 0x49 currently uses 14lpp tech DLL whose internal
-	 * gating cannot guarantee MCLK timing requirement i.e.
-	 * when MCLK is gated OFF, it is not gated for less than 0.5us
-	 * and MCLK must be switched on for at-least 1us before DATA
-	 * starts coming.
-	 */
-	if ((major == 1) && ((minor == 0x42) || (minor == 0x46) ||
-				(minor == 0x49) || (minor >= 0x6b)))
-		msm_host->use_14lpp_dll = true;
-
-	/* Fake 3.0V support for SDIO devices which requires such voltage */
-	if (msm_host->core_3_0v_support) {
-		caps |= CORE_3_0V_SUPPORT;
-			writel_relaxed((readl_relaxed(host->ioaddr +
-			SDHCI_CAPABILITIES) | caps), host->ioaddr +
-			msm_host_offset->CORE_VENDOR_SPEC_CAPABILITIES0);
-	}
-
-	if ((major == 1) && (minor >= 0x49))
-		msm_host->rclk_delay_fix = true;
-	/*
-	 * Mask 64-bit support for controller with 32-bit address bus so that
-	 * smaller descriptor size will be used and improve memory consumption.
-	 */
-	if (!msm_host->pdata->largeaddressbus)
-		caps &= ~CORE_SYS_BUS_SUPPORT_64_BIT;
-
-	writel_relaxed(caps, host->ioaddr +
-		msm_host_offset->CORE_VENDOR_SPEC_CAPABILITIES0);
-	/* keep track of the value in SDHCI_CAPABILITIES */
-	msm_host->caps_0 = caps;
-
-	if ((major == 1) && (minor >= 0x6b)) {
-		msm_host->ice_hci_support = true;
-		host->cdr_support = true;
-	}
-
-	/* 7FF projects with 7nm DLL */
-	if ((major == 1) && ((minor == 0x6e) || (minor == 0x71) ||
-				(minor == 0x72)))
-		msm_host->use_7nm_dll = true;
-}
-
-#ifdef CONFIG_MMC_CQ_HCI
-static void sdhci_msm_cmdq_init(struct sdhci_host *host,
-				struct platform_device *pdev)
-{
-	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
-	struct sdhci_msm_host *msm_host = pltfm_host->priv;
-
-	if (nocmdq) {
-		dev_dbg(&pdev->dev, "CMDQ disabled via cmdline\n");
-		return;
-	}
-
-	host->cq_host = cmdq_pltfm_init(pdev);
-	if (IS_ERR(host->cq_host)) {
-		dev_dbg(&pdev->dev, "cmdq-pltfm init: failed: %ld\n",
-			PTR_ERR(host->cq_host));
-		host->cq_host = NULL;
-	} else {
-		msm_host->mmc->caps2 |= MMC_CAP2_CMD_QUEUE;
-	}
-}
-#else
-static void sdhci_msm_cmdq_init(struct sdhci_host *host,
-				struct platform_device *pdev)
-{
-
-}
-#endif
-
-static bool sdhci_msm_is_bootdevice(struct device *dev)
-{
-	if (strnstr(saved_command_line, "androidboot.bootdevice=",
-		    strlen(saved_command_line))) {
-		char search_string[50];
-
-		snprintf(search_string, ARRAY_SIZE(search_string),
-			"androidboot.bootdevice=%s", dev_name(dev));
-		if (strnstr(saved_command_line, search_string,
-		    strlen(saved_command_line)))
-			return true;
-		else
-			return false;
-	}
-
-	/*
-	 * "androidboot.bootdevice=" argument is not present then
-	 * return true as we don't know the boot device anyways.
-	 */
-	return true;
-}
-
-/* add sdcard slot info for factory mode
- *    begin
- *    */
-static struct kobject *card_slot_device;
-static struct sdhci_host *card_host;
-static ssize_t card_slot_status_show(struct device *dev,
-					       struct device_attribute *attr, char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "%d\n", mmc_gpio_get_cd(card_host->mmc));
-}
-
-static DEVICE_ATTR(card_slot_status, 0444, card_slot_status_show, NULL);
-
-int32_t card_slot_init_device_name(void)
-{
-	int32_t error = 0;
-
-	if(card_slot_device != NULL){
-		pr_err("card_slot already created\n");
-		return 0;
-	}
-	card_slot_device = kobject_create_and_add("card_slot", NULL);
-	if (card_slot_device == NULL) {
-		printk("%s: card_slot register failed\n", __func__);
-		error = -ENOMEM;
-		return error ;
-	}
-	error = sysfs_create_file(card_slot_device, &dev_attr_card_slot_status.attr);
-	if (error) {
-		printk("%s: card_slot card_slot_status_create_file failed\n", __func__);
-		kobject_del(card_slot_device);
-	}
-	return 0 ;
-}
-/* add sdcard slot info for factory mode
- *    end
- *    */
+	.quirks2 = SDHCI_QUIRK2_PRESET_VALUE_BROKEN,
+	.ops = &sdhci_msm_ops,
+};
 
 static int sdhci_msm_probe(struct platform_device *pdev)
 {
